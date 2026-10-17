@@ -58,6 +58,16 @@ type RunStatus = (typeof RUN_STATUSES)[number]
 const ENGAGEMENTS = ['received', 'opened', 'clicked'] as const
 type Engagement = (typeof ENGAGEMENTS)[number]
 
+/**
+ * How many distinct engaged run ids this filter will ever collect for one campaign.
+ *
+ * Far above any real campaign's run count, and ordered by the newest activity first, so a campaign that
+ * somehow exceeds it loses only its oldest engaged runs — the ones least likely to still be on the page
+ * somebody is paging through. Without a cap this builds an unbounded in-memory array and an unbounded
+ * `IN (...)` list from one request.
+ */
+const ENGAGED_RUN_ID_CAP = 10_000
+
 function readCampaignId(req: Request): string | null {
   // .../campaigns/<id>/runs
   return readPathUuid(req, 2)
@@ -114,13 +124,19 @@ export async function GET(req: Request) {
   let engagedRunIds: string[] | null = null
   if (engagement !== null) {
     const sql = engagement === 'received'
-      ? `select distinct run_id from marketing_message_sends
-          where tenant_id = ? and organization_id = ? and campaign_id = ? and status = 'sent' and run_id is not null`
-      : `select distinct run_id from marketing_message_send_events
-          where tenant_id = ? and organization_id = ? and campaign_id = ? and type = ?`
+      ? `select run_id from marketing_message_sends
+          where tenant_id = ? and organization_id = ? and campaign_id = ? and status = 'sent' and run_id is not null
+          group by run_id
+          order by max(sent_at) desc
+          limit ?`
+      : `select run_id from marketing_message_send_events
+          where tenant_id = ? and organization_id = ? and campaign_id = ? and type = ?
+          group by run_id
+          order by max(occurred_at) desc
+          limit ?`
     const params = engagement === 'received'
-      ? [scope.tenantId, scope.organizationId, campaign.id]
-      : [scope.tenantId, scope.organizationId, campaign.id, engagement === 'clicked' ? 'clicked' : 'opened']
+      ? [scope.tenantId, scope.organizationId, campaign.id, ENGAGED_RUN_ID_CAP]
+      : [scope.tenantId, scope.organizationId, campaign.id, engagement === 'clicked' ? 'clicked' : 'opened', ENGAGED_RUN_ID_CAP]
     const rows = await em.execute<Array<{ run_id: string }>>(sql, params)
     engagedRunIds = rows.map((row) => row.run_id).filter((id): id is string => !!id)
   }
